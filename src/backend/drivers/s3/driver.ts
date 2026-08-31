@@ -237,20 +237,18 @@ export class S3Driver implements StorageDriver {
     dstPhys: string,
   ): Promise<void> {
     await this.checkDogeToken()
-    const srcBase = this.getRemotePath(srcPhys)
-    const dstBase = this.getRemotePath(dstPhys)
-
-    for (const name of names) {
-      const srcPath = joinPath(srcBase, name)
-      const dstPath = joinPath(dstBase, name)
-      const head = await this.client.headObject(srcPath)
-      if (head) {
-        await this.client.copyObject(srcPath, dstPath, head.size)
-        await this.client.deleteObject(srcPath)
-      } else {
-        await this.copyDirRecursive(srcPath, dstPath)
-        await this.removeDirRecursive(srcPath)
-      }
+    // srcPhys/dstPhys 已含完整文件名（moveItems 逐个 name 解析后传入），
+    // 不能再 joinPath(names)，否则路径变成 "docs/a.txt/a.txt" 导致 head 404
+    // 后误入 copyDirRecursive 空转 —— 表现为"成功但没效果"。
+    const srcPath = this.getRemotePath(srcPhys)
+    const dstPath = this.getRemotePath(dstPhys)
+    const head = await this.client.headObject(srcPath)
+    if (head) {
+      await this.client.copyObject(srcPath, dstPath, head.size)
+      await this.client.deleteObject(srcPath)
+    } else {
+      await this.copyDirRecursive(srcPath, dstPath)
+      await this.removeDirRecursive(srcPath)
     }
   }
 
@@ -262,18 +260,14 @@ export class S3Driver implements StorageDriver {
     dstPhys: string,
   ): Promise<void> {
     await this.checkDogeToken()
-    const srcBase = this.getRemotePath(srcPhys)
-    const dstBase = this.getRemotePath(dstPhys)
-
-    for (const name of names) {
-      const srcPath = joinPath(srcBase, name)
-      const dstPath = joinPath(dstBase, name)
-      const head = await this.client.headObject(srcPath)
-      if (head) {
-        await this.client.copyObject(srcPath, dstPath, head.size)
-      } else {
-        await this.copyDirRecursive(srcPath, dstPath)
-      }
+    // 同 move：srcPhys/dstPhys 已含完整文件名，直接用。
+    const srcPath = this.getRemotePath(srcPhys)
+    const dstPath = this.getRemotePath(dstPhys)
+    const head = await this.client.headObject(srcPath)
+    if (head) {
+      await this.client.copyObject(srcPath, dstPath, head.size)
+    } else {
+      await this.copyDirRecursive(srcPath, dstPath)
     }
   }
 
