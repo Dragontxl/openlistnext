@@ -139,26 +139,92 @@ export class QuarkDriver implements StorageDriver {
 
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
+    // dstPhysical 含文件名（op 层传入 dstDir/name 的完整路径），
+    // client.move 需要目标"文件夹"ID —— 必须取其父目录解析，
+    // 否则会到目标文件夹里找还没移过去的文件而报 not found。
     const fileId = await this.resolveFileId(srcPhysical)
-    const dstId = await this.resolveFileId(dstDir)
+    const dstId = await this.resolveFileId(this.getDirPath(dstPhysical))
     await this.client.move([fileId], dstId)
   }
 
   async copy(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
+    // 同 move：取 dstPhysical 的父目录解析目标文件夹 ID。
     const fileId = await this.resolveFileId(srcPhysical)
-    const dstId = await this.resolveFileId(dstDir)
+    const dstId = await this.resolveFileId(this.getDirPath(dstPhysical))
     await this.client.copy([fileId], dstId)
+  }
+
+  /** 物理路径的父目录（"/a/b/c.txt" → "/a/b"；根级文件 → "/"） */
+  private getDirPath(physicalPath: string): string {
+    const parts = physicalPath.split("/").filter(Boolean)
+    parts.pop()
+    return "/" + parts.join("/")
+  }
+
+  /**
+   * 中转上传（跨账号复制用）：按 OpenList quark_uc 官方协议执行
+   *   1) /file/upload/pre 创建上传任务
+   *   2) /file/update/hash 秒传检测（全量 md5+sha1，命中零数据传输）
+   *   3) 未命中 → 分片上传（每片先 /file/upload/auth 取预签名再 PUT 到 OSS）
+   *   4) CompleteMultipartUpload（XML + callback）
+   *   5) /file/upload/finish
+   */
+  async uploadStream(params: {
+    dstPhysicalPath: string
+    fileName: string
+    size: number
+    md5: string
+    sha1: string
+    getStream: (start: number) => Promise<ReadableStream<Uint8Array>>
+  }): Promise<void> {
+    const parentId = await this.resolveFileId(
+      this.getDirPath(params.dstPhysicalPath),
+    )
+    const pre = await this.client.uploadPre(
+      parentId,
+      params.fileName,
+      params.size,
+    )
+    if (pre.finish) {
+      // 秒传命中：服务端已直接创建文件，无需传输数据
+      return
+    }
+
+    // 全量哈希秒传检测（/file/update/hash）
+    if (await this.client.uploadHash(pre.task_id, params.md5, params.sha1)) {
+      return
+    }
+
+    // 分片上传（part_size 由服务端下发，缺省 8MB）
+    const partSize = pre.metadata?.part_size || 8 * 1024 * 1024
+    const etags: string[] = []
+    let partNumber = 1
+    for (let offset = 0; offset < params.size; offset += partSize) {
+      const len = Math.min(partSize, params.size - offset)
+      const stream = await params.getStream(offset)
+      const chunk = await readStreamFully(stream, len)
+      const etag = await this.client.uploadPartToS3({
+        pre,
+        partNumber,
+        body: chunk,
+      })
+      etags.push(etag)
+      partNumber++
+    }
+
+    await this.client.uploadComplete(pre, etags)
+    await this.client.uploadFinish(pre)
   }
 
   async put(
@@ -168,6 +234,19 @@ export class QuarkDriver implements StorageDriver {
   ): Promise<void> {
     throw new Error(
       "[Quark/UC] Direct put not supported in stateless environment",
+    )
+  }
+
+  async putStream(
+    _virtualPath: string,
+    _physicalPath: string,
+    _stream: ReadableStream<Uint8Array>,
+    _size?: number,
+  ): Promise<void> {
+    // 夸克上传协议需要先算哈希再分片上传，由 uploadStream 承担，
+    // 直接流式上传不支持。
+    throw new Error(
+      "[Quark/UC] Direct stream upload not supported; use uploadStream (relay copy)",
     )
   }
 
@@ -208,4 +287,38 @@ export class QuarkDriver implements StorageDriver {
 
     return currentId
   }
+}
+
+/** 从可读流中精确读取 want 字节（不足则报错），有界内存 */
+async function readStreamFully(
+  stream: ReadableStream<Uint8Array>,
+  want: number,
+): Promise<Uint8Array> {
+  const out = new Uint8Array(want)
+  const reader = stream.getReader()
+  let filled = 0
+  try {
+    while (filled < want) {
+      const { done, value } = await reader.read()
+      if (done) break
+      const take = Math.min(value.length, want - filled)
+      out.set(value.subarray(0, take), filled)
+      filled += take
+      if (take < value.length) {
+        // 多余数据直接丢弃（不应发生：按 Range 取流）
+        await reader.cancel().catch(() => {})
+        break
+      }
+    }
+  } finally {
+    if (filled < want) {
+      await reader.cancel().catch(() => {})
+    }
+  }
+  if (filled < want) {
+    throw new Error(
+      `[Quark/UC] stream ended early: got ${filled}/${want} bytes`,
+    )
+  }
+  return out
 }

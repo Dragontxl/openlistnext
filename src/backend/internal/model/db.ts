@@ -60,6 +60,14 @@ export const defaultDb = {
       flag: 0,
     },
     {
+      key: "relay_storage",
+      value: "",
+      type: "string",
+      help: "Relay Storage Mount Path For Cross-storage Copy/move (e.g. /r2, empty=disabled)",
+      group: 1,
+      flag: 0,
+    },
+    {
       key: "robots_txt",
       value: "User-agent: *\nDisallow: /",
       type: "text",

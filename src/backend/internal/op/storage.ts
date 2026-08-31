@@ -21,6 +21,7 @@ import { Cloud189Driver } from "../../drivers/189/driver"
 import { WebdavDriver } from "../../drivers/webdav/driver"
 import { WoPanDriver, normalizeWoPanAddition } from "../../drivers/wopan/driver"
 import { S3Driver, normalizeS3Addition } from "../../drivers/s3/driver"
+import { copyBetweenStorages as relayCopyBetweenStorages } from "./relay"
 
 // LocalDriver is not available in Cloudflare Workers (no fs module).
 // When running in Node.js container mode, import dynamically on first use.
@@ -736,19 +737,46 @@ export async function moveItems(
     if (srcResolved.isVirtual || dstResolved.isVirtual) {
       throw new Error("failed get storage: storage not found")
     }
-
     const driver = await getDriver(
       srcResolved.storage!.driver,
       srcResolved.storage,
     )
     try {
-      await driver.move(
-        srcDir,
-        dstDir,
-        [name],
-        srcResolved.physical!,
-        dstResolved.physical!,
-      )
+      if (srcResolved.storage!.id === dstResolved.storage!.id) {
+        // 同一存储：服务端移动
+        await driver.move(
+          srcDir,
+          dstDir,
+          [name],
+          srcResolved.physical!,
+          dstResolved.physical!,
+        )
+      } else {
+        // 跨存储：先尝试服务端移动（同账号多挂载），失败回退中转复制+删源
+        try {
+          await driver.move(
+            srcDir,
+            dstDir,
+            [name],
+            srcResolved.physical!,
+            dstResolved.physical!,
+          )
+        } catch (e) {
+          await relayCopyBetweenStorages({
+            srcStorage: srcResolved.storage,
+            dstStorage: dstResolved.storage,
+            srcDir,
+            dstDir,
+            srcVirtual,
+            dstVirtual,
+            srcPhysical: srcResolved.physical!,
+            dstPhysical: dstResolved.physical!,
+            name,
+            operation: "move",
+          })
+          await driver.remove(srcVirtual, srcResolved.physical!, [name])
+        }
+      }
     } finally {
       await flushPendingDriverState(
         srcResolved.storage!.driver,
@@ -780,13 +808,30 @@ export async function copyItems(
       srcResolved.storage,
     )
     try {
-      await driver.copy(
-        srcDir,
-        dstDir,
-        [name],
-        srcResolved.physical!,
-        dstResolved.physical!,
-      )
+      if (srcResolved.storage!.id === dstResolved.storage!.id) {
+        // 同一存储：服务端复制
+        await driver.copy(
+          srcDir,
+          dstDir,
+          [name],
+          srcResolved.physical!,
+          dstResolved.physical!,
+        )
+      } else {
+        // 跨存储：中转复制（relay_storage 未配置时内部回退服务端尝试）
+        await relayCopyBetweenStorages({
+          srcStorage: srcResolved.storage,
+          dstStorage: dstResolved.storage,
+          srcDir,
+          dstDir,
+          srcVirtual,
+          dstVirtual,
+          srcPhysical: srcResolved.physical!,
+          dstPhysical: dstResolved.physical!,
+          name,
+          operation: "copy",
+        })
+      }
     } finally {
       await flushPendingDriverState(
         srcResolved.storage!.driver,

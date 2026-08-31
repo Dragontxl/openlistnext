@@ -84,6 +84,8 @@
   "qbittorrent_seedtime": "qBittorrent 做种时长",
   "qbittorrent_url": "qBittorrent Web 地址",
   "readme_autorender": "自动渲染 README",
+  "relay_storage": "中转存储（跨存储复制/移动）",
+  "relay_storage_none": "无（禁用跨存储复制）",
   "robots_txt": "robots.txt 内容",
   "s3_access_key_id": "S3 Access Key ID",
   "s3_buckets": "S3 Buckets 配置",

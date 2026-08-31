@@ -84,6 +84,8 @@
   "qbittorrent_seedtime": "qBittorrent seedtime",
   "qbittorrent_url": "qBittorrent url",
   "readme_autorender": "Readme autorender",
+  "relay_storage": "Relay Storage (cross-storage copy/move)",
+  "relay_storage_none": "None (disable cross-storage copy)",
   "robots_txt": "Robots txt",
   "s3_access_key_id": "S3 access key id",
   "s3_buckets": "S3 buckets",

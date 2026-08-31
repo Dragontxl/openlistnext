@@ -164,8 +164,11 @@ export async function signS3Headers(
   const signedHeaders = sortedHeaderKeys.join(";")
 
   // Canonical URI
+  // URL.pathname 已是"每段编码一次"的形式，与实际发送的请求行逐字节一致。
+  // S3 服务端按请求行原文验证签名，绝不能再对其二次编码（否则含中文/空格
+  // 等非 ASCII 字符的对象 key 必然 SignatureDoesNotMatch）
   const pathname = parsedUrl.pathname || "/"
-  const canonicalUri = rfc3986UriEncode(pathname, false)
+  const canonicalUri = pathname
 
   // Canonical Query String
   const queryParams: [string, string][] = []
@@ -263,7 +266,8 @@ export async function presignS3Url(opts: PresignUrlOptions): Promise<string> {
   }
 
   const pathname = parsedUrl.pathname || "/"
-  const canonicalUri = rfc3986UriEncode(pathname, false)
+  // 与 signS3Headers 相同：pathname 已编码一次，与请求行一致，勿二次编码
+  const canonicalUri = pathname
 
   const queryParams: [string, string][] = []
   parsedUrl.searchParams.forEach((val, key) => {

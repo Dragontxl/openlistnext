@@ -154,4 +154,21 @@ export interface StorageDriver {
     dstPhys: string,
   ): Promise<void>
   put(virtualPath: string, physicalPath: string, content: Buffer): Promise<void>
+  /**
+   * 流式上传（可选实现）：有界内存地写入任意大小的文件。
+   * 目前 S3 系 driver 支持；中转复制时优先使用。
+   */
+  putStream?(
+    virtualPath: string,
+    physicalPath: string,
+    stream: ReadableStream<Uint8Array>,
+    size?: number,
+  ): Promise<void>
+  /** 支持流式上传的目标 driver 置为 true（配合 putStream 特性检测） */
+  readonly supportsStreamUpload?: boolean
+  /** 按物理路径读取对象/文件的字节流，start 为起始偏移（中转回读用） */
+  getStream?(
+    physicalPath: string,
+    start?: number,
+  ): Promise<ReadableStream<Uint8Array>>
 }

@@ -93,28 +93,43 @@ export interface QuarkRenameResp extends QuarkResp {
   data: QuarkRenameData[]
 }
 
-// Pre-hash upload response
-export interface QuarkUploadPreHashResp extends QuarkResp {
-  data: {
-    task_id: string
-    finish?: boolean
-    hash_match?: boolean
-    fid?: string
-    upload_id?: string
-    obj_key?: string
-    upload_url?: string
-    auth_info?: string
-    auth_meta?: string
-    md5?: string
-    callback_url?: string
+/** /file/upload/pre 响应（创建上传任务） */
+export interface QuarkUploadPreData {
+  task_id: string
+  finish?: boolean
+  upload_id?: string
+  obj_key?: string
+  upload_url?: string
+  bucket?: string
+  auth_info?: string
+  fid?: string
+  callback?: { callbackUrl: string; callbackBody: string }
+  format_type?: string
+  size?: number
+  metadata?: {
+    part_thread?: number
+    acc2?: string
+    acc1?: string
+    part_size?: number
   }
 }
 
-export interface QuarkUploadCommitResp extends QuarkResp {
+export interface QuarkUploadPreResp extends QuarkResp {
+  data: QuarkUploadPreData
+}
+
+/** /file/update/hash 秒传检测响应 */
+export interface QuarkHashResp extends QuarkResp {
   data: {
     finish?: boolean
     fid?: string
-    file_name?: string
+  }
+}
+
+/** /file/upload/auth 预签名响应 */
+export interface QuarkUpAuthResp extends QuarkResp {
+  data: {
+    auth_key?: string
   }
 }
 

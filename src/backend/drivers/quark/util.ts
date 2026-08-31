@@ -1,5 +1,6 @@
 // Quark/UC drive HTTP client utilities
 // Based on: https://github.com/OpenListTeam/OpenList/tree/main/drivers/quark_uc
+import CryptoJS from "crypto-js"
 import {
   QuarkAddition,
   QuarkConf,
@@ -8,8 +9,10 @@ import {
   QuarkDownResp,
   QuarkMkdirResp,
   QuarkRenameResp,
-  QuarkUploadPreHashResp,
-  QuarkUploadCommitResp,
+  QuarkUploadPreData,
+  QuarkUploadPreResp,
+  QuarkHashResp,
+  QuarkUpAuthResp,
   QuarkVariant,
 } from "./types"
 
@@ -307,45 +310,216 @@ export class QuarkClient {
     })
   }
 
-  // ---- Upload: pre-hash check ----
+  // ---- Upload: create task (/file/upload/pre) ----
 
-  async uploadPreHash(
+  async uploadPre(
     parentId: string,
     fileName: string,
     fileSize: number,
-    preHash: string,
-  ): Promise<QuarkUploadPreHashResp["data"]> {
-    const resp = await this.request<QuarkUploadPreHashResp>(
-      "/file/uploadpre",
+    mimeType?: string,
+  ): Promise<QuarkUploadPreData> {
+    const now = Date.now()
+    const resp = await this.request<QuarkUploadPreResp>(
+      "/file/upload/pre",
       "POST",
       undefined,
       {
         ccp_hash_update: true,
         dir_name: "",
         file_name: fileName,
+        format_type: mimeType || guessFormatType(fileName),
+        l_created_at: now,
+        l_updated_at: now,
         pdir_fid: parentId,
         size: fileSize,
-        pre_hash: preHash,
-        format_type: guessFormatType(fileName),
       },
     )
     return resp.data
   }
 
-  // ---- Upload: commit after S3 upload ----
+  // ---- Upload: instant upload check (/file/update/hash) ----
 
-  async uploadCommit(
+  /** 全量 md5+sha1 命中则服务端直接创建文件（零数据传输） */
+  async uploadHash(
     taskId: string,
     md5: string,
-    objKey: string,
-  ): Promise<QuarkUploadCommitResp["data"]> {
-    const resp = await this.request<QuarkUploadCommitResp>(
-      "/file/upload/commit",
+    sha1: string,
+  ): Promise<boolean> {
+    const resp = await this.request<QuarkHashResp>(
+      "/file/update/hash",
       "POST",
       undefined,
-      { task_id: taskId, md5: md5, obj_key: objKey },
+      { md5, sha1, task_id: taskId },
     )
-    return resp.data
+    return !!resp.data?.finish
+  }
+
+  // ---- Upload: presign (/file/upload/auth) ----
+
+  /** 服务端按签名原文（auth_meta）预计算 OSS Authorization */
+  private async uploadAuth(params: {
+    authInfo: string
+    authMeta: string
+    taskId: string
+  }): Promise<string> {
+    const resp = await this.request<QuarkUpAuthResp>(
+      "/file/upload/auth",
+      "POST",
+      undefined,
+      {
+        auth_info: params.authInfo,
+        auth_meta: params.authMeta,
+        task_id: params.taskId,
+      },
+    )
+    const key = resp.data?.auth_key
+    if (!key) {
+      throw new Error("[Quark/UC] upload/auth response missing auth_key")
+    }
+    return key
+  }
+
+  // ---- Upload: put part to OSS ----
+
+  /** 上传单个分片：先取预签名再 PUT，返回分片 ETag（complete 需要） */
+  async uploadPartToS3(params: {
+    pre: QuarkUploadPreData
+    partNumber: number
+    body: Uint8Array
+  }): Promise<string> {
+    const pre = this.checkPreFields(params.pre)
+    const mime = "application/octet-stream"
+    const timeStr = new Date().toUTCString()
+    const authMeta = [
+      "PUT",
+      mime,
+      timeStr,
+      `x-oss-date:${timeStr}`,
+      `x-oss-user-agent:${OSS_USER_AGENT}`,
+      `/${pre.bucket}/${pre.obj_key}?partNumber=${params.partNumber}&uploadId=${pre.upload_id}`,
+    ].join("\n")
+    const authKey = await this.uploadAuth({
+      authInfo: pre.auth_info!,
+      authMeta,
+      taskId: pre.task_id,
+    })
+
+    const url =
+      `https://${pre.bucket}.${stripScheme(pre.upload_url!)}/${pre.obj_key}` +
+      `?partNumber=${params.partNumber}&uploadId=${encodeURIComponent(pre.upload_id!)}`
+    const resp = await fetch(url, {
+      method: "PUT",
+      headers: {
+        Authorization: authKey,
+        "Content-Type": mime,
+        Referer: "https://pan.quark.cn/",
+        "x-oss-date": timeStr,
+        "x-oss-user-agent": OSS_USER_AGENT,
+      },
+      body: params.body as Uint8Array<ArrayBuffer>,
+    })
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "")
+      throw new Error(
+        `[Quark/UC] upload part ${params.partNumber} failed [${resp.status}]: ${text.slice(0, 200)}`,
+      )
+    }
+    return resp.headers.get("etag") || ""
+  }
+
+  // ---- Upload: complete multipart (CompleteMultipartUpload XML) ----
+
+  async uploadComplete(
+    pre: QuarkUploadPreData,
+    etags: string[],
+  ): Promise<void> {
+    const p = this.checkPreFields(pre)
+    let xml = `<?xml version="1.0" encoding="UTF-8"?>\n<CompleteMultipartUpload>\n`
+    etags.forEach((etag, i) => {
+      xml += `<Part>\n<PartNumber>${i + 1}</PartNumber>\n<ETag>${etag}</ETag>\n</Part>\n`
+    })
+    xml += `</CompleteMultipartUpload>`
+
+    const contentMd5 = CryptoJS.MD5(xml).toString(CryptoJS.enc.Base64)
+    const callbackJson = JSON.stringify(pre.callback || {})
+    const callbackBase64 = CryptoJS.enc.Base64.stringify(
+      CryptoJS.enc.Utf8.parse(callbackJson),
+    )
+
+    const timeStr = new Date().toUTCString()
+    const authMeta = [
+      "POST",
+      contentMd5,
+      "application/xml",
+      timeStr,
+      `x-oss-callback:${callbackBase64}`,
+      `x-oss-date:${timeStr}`,
+      `x-oss-user-agent:${OSS_USER_AGENT}`,
+      `/${p.bucket}/${p.obj_key}?uploadId=${p.upload_id}`,
+    ].join("\n")
+    const authKey = await this.uploadAuth({
+      authInfo: p.auth_info!,
+      authMeta,
+      taskId: p.task_id,
+    })
+
+    const url =
+      `https://${p.bucket}.${stripScheme(p.upload_url!)}/${p.obj_key}` +
+      `?uploadId=${encodeURIComponent(p.upload_id!)}`
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: authKey,
+        "Content-MD5": contentMd5,
+        "Content-Type": "application/xml",
+        Referer: "https://pan.quark.cn/",
+        "x-oss-callback": callbackBase64,
+        "x-oss-date": timeStr,
+        "x-oss-user-agent": OSS_USER_AGENT,
+      },
+      body: xml,
+    })
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "")
+      throw new Error(
+        `[Quark/UC] upload complete failed [${resp.status}]: ${text.slice(0, 200)}`,
+      )
+    }
+  }
+
+  // ---- Upload: finish (/file/upload/finish) ----
+
+  async uploadFinish(pre: QuarkUploadPreData): Promise<void> {
+    await this.request("/file/upload/finish", "POST", undefined, {
+      obj_key: pre.obj_key,
+      task_id: pre.task_id,
+    })
+  }
+
+  /** 校验 upload/pre 响应包含完成上传所需的全部字段 */
+  private checkPreFields(pre: QuarkUploadPreData): QuarkUploadPreData & {
+    bucket: string
+    obj_key: string
+    upload_id: string
+    upload_url: string
+    auth_info: string
+  } {
+    if (
+      !pre.bucket ||
+      !pre.obj_key ||
+      !pre.upload_id ||
+      !pre.upload_url ||
+      !pre.auth_info
+    ) {
+      throw new Error("[Quark/UC] upload/pre response missing upload fields")
+    }
+    return pre as QuarkUploadPreData & {
+      bucket: string
+      obj_key: string
+      upload_id: string
+      upload_url: string
+      auth_info: string
+    }
   }
 
   // ---- Init (validates cookie by calling /config) ----
@@ -362,6 +536,19 @@ export class QuarkClient {
       console.warn(`[Quark/UC] init warning:`, e.message)
     }
   }
+}
+
+// ================================================================
+// OSS upload constants (quark/uc parts upload to aliyun OSS)
+// ================================================================
+
+/** OSS 请求固定 UA（与官方客户端一致，参与预签名原文） */
+const OSS_USER_AGENT =
+  "aliyun-sdk-js/6.6.1 Chrome 98.0.4758.80 on Windows 10 64-bit"
+
+/** 去掉 URL 的 scheme 与尾部斜杠（拼 bucket 子域名用） */
+function stripScheme(url: string): string {
+  return url.replace(/^https?:\/\//, "").replace(/\/+$/, "")
 }
 
 // ================================================================

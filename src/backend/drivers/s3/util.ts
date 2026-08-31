@@ -762,6 +762,123 @@ export class S3Client {
     }
   }
 
+  /** GET 对象返回原始 Response（可读流），可选 Range（中转回读用） */
+  public async getObject(
+    key: string,
+    range?: { start: number; end?: number },
+  ): Promise<Response> {
+    const url = this.getUrl(key)
+    const extraHeaders: Record<string, string> = {}
+    if (range) {
+      extraHeaders["range"] =
+        range.end !== undefined
+          ? `bytes=${range.start}-${range.end}`
+          : `bytes=${range.start}-`
+    }
+    const resp = await this.fetch("GET", url, null, extraHeaders)
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "")
+      throw parseS3Error(text, resp.status)
+    }
+    return resp
+  }
+
+  /**
+   * 数据型分片上传：从可读流读取数据按 partSize 分片 PUT，
+   * 内存有界（每片 8MB 缓冲），失败自动 abort。
+   * onPart 回调可在写入同时做增量哈希等旁路处理。
+   */
+  public async multipartUpload(
+    key: string,
+    stream: ReadableStream<Uint8Array>,
+    opts: {
+      partSize?: number
+      onPart?: (chunk: Uint8Array) => void
+    } = {},
+  ): Promise<void> {
+    const cleanKey = getKey(key, false)
+    const partSize = opts.partSize || 8 * 1024 * 1024
+
+    // 1. Init
+    const initUrl = this.getUrl(cleanKey, { uploads: "" })
+    const initResp = await this.fetch("POST", initUrl)
+    const initText = await initResp.text()
+    if (!initResp.ok) {
+      throw parseS3Error(initText, initResp.status)
+    }
+    const uploadId = parseInitiateMultipartUpload(initText)
+
+    const parts: { partNumber: number; etag: string }[] = []
+    const reader = stream.getReader()
+    const buffer = new Uint8Array(partSize)
+    let bufferLen = 0
+    let partNumber = 1
+
+    const uploadBuffer = async () => {
+      if (bufferLen === 0) return
+      const chunk =
+        bufferLen === buffer.length ? buffer : buffer.slice(0, bufferLen)
+      const partUrl = this.getUrl(cleanKey, {
+        partNumber: partNumber.toString(),
+        uploadId,
+      })
+      const partResp = await this.fetch("PUT", partUrl, chunk, {
+        "content-type": "application/octet-stream",
+      })
+      if (!partResp.ok) {
+        const text = await partResp.text().catch(() => "")
+        throw parseS3Error(text, partResp.status)
+      }
+      const etag = (partResp.headers.get("etag") || "").replace(/"/g, "")
+      parts.push({ partNumber, etag })
+      partNumber++
+      bufferLen = 0
+    }
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (opts.onPart && value) opts.onPart(value)
+        let offset = 0
+        while (offset < value.length) {
+          const space = buffer.length - bufferLen
+          const take = Math.min(space, value.length - offset)
+          buffer.set(value.subarray(offset, offset + take), bufferLen)
+          bufferLen += take
+          offset += take
+          if (bufferLen === buffer.length) {
+            await uploadBuffer()
+          }
+        }
+      }
+      await uploadBuffer()
+
+      // 2. Complete
+      const completeUrl = this.getUrl(cleanKey, { uploadId })
+      const completeBody = [
+        "<CompleteMultipartUpload>",
+        ...parts.map(
+          (p) =>
+            `<Part><PartNumber>${p.partNumber}</PartNumber><ETag>${p.etag}</ETag></Part>`,
+        ),
+        "</CompleteMultipartUpload>",
+      ].join("")
+      const completeResp = await this.fetch("POST", completeUrl, completeBody, {
+        "content-type": "application/xml",
+      })
+      if (!completeResp.ok) {
+        const completeText = await completeResp.text().catch(() => "")
+        throw parseS3Error(completeText, completeResp.status)
+      }
+    } catch (err) {
+      await reader.cancel().catch(() => {})
+      const abortUrl = this.getUrl(cleanKey, { uploadId })
+      await this.fetch("DELETE", abortUrl).catch(() => {})
+      throw err
+    }
+  }
+
   public async getLink(
     key: string,
     fileName: string,

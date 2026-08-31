@@ -60,23 +60,33 @@ function run(cmd, opts = {}) {
   }
 }
 
-/** 解析 `wrangler kv namespace list` 的表格输出，返回 { id: title } 映射
- *  注意：wrangler 4.x 在 Windows 输出 Unicode 竖线 │，其他平台为 | */
+/** 解析 `wrangler kv namespace list` 输出，返回 { id: title } 映射。
+ *  兼容：新版 wrangler 的 JSON 数组输出 + 旧版表格输出
+ *  （旧表格在 Windows 用 Unicode 竖线 │，其他平台为 |） */
 function parseNamespaceList(stdout) {
+  const clean = String(stdout).replace(/\x1b\[[0-9;]*m/g, "")
   const map = {}
+  // JSON 格式: { "id": "...", "title": "..." }（id/title 顺序不限）
+  const jsonRe = /"id"\s*:\s*"([0-9a-fA-F]{32})"\s*,\s*"title"\s*:\s*"([^"]+)"/g
+  let m
+  while ((m = jsonRe.exec(clean)) !== null) {
+    map[m[2]] = m[1]
+  }
+  if (Object.keys(map).length > 0) return map
   // 表格行: │ <id> │ <title> │  （兼容 | 和 │）
   const re = /[|│]\s*([0-9a-fA-F]{32})\s*[|│]\s*([^|│\n]+?)\s*[|│]/g
-  let m
-  while ((m = re.exec(stdout)) !== null) {
+  while ((m = re.exec(clean)) !== null) {
     map[m[2].trim()] = m[1].trim()
   }
   return map
 }
 
-/** 从 `wrangler kv namespace create` 输出提取 id（剥离 ANSI 颜色码） */
+/** 从 `wrangler kv namespace create` 输出提取 id（剥离 ANSI 颜色码）。
+ *  兼容 `id = "..."`（旧）与 `"id": "..."`（新 JSON）两种格式。 */
 function parseCreatedId(stdout) {
   const clean = String(stdout).replace(/\x1b\[[0-9;]*m/g, "")
-  const m = clean.match(/id\s*=\s*"([0-9a-fA-F]{32})"/)
+  let m = clean.match(/id\s*=\s*"([0-9a-fA-F]{32})"/)
+  if (!m) m = clean.match(/"id"\s*:\s*"([0-9a-fA-F]{32})"/)
   return m ? m[1] : null
 }
 

@@ -324,38 +324,25 @@ export class S3Driver implements StorageDriver {
     names: string[],
   ): Promise<void> {
     await this.checkDogeToken()
-    const basePath = this.getRemotePath(physicalPath)
-
-    if (names && names.length > 0) {
-      for (const name of names) {
-        const targetPath = joinPath(basePath, name)
-        const head = await this.client.headObject(targetPath)
-        if (head) {
-          await this.client.deleteObject(targetPath)
-        } else {
-          await this.removeDirRecursive(targetPath)
-        }
-      }
+    // physicalPath 已含完整文件名（removeItems 逐个 name 解析后传入），
+    // 不能再 joinPath(names)，否则路径变成 "docs/a.txt/a.txt" 导致 head 404
+    // 后误入空前缀递归 —— 表现为"删除成功但实际未删"。
+    const targetPath = this.getRemotePath(physicalPath)
+    const head = await this.client.headObject(targetPath)
+    if (head) {
+      await this.client.deleteObject(targetPath)
     } else {
-      const head = await this.client.headObject(basePath)
-      if (head) {
-        await this.client.deleteObject(basePath)
-      } else {
-        await this.removeDirRecursive(basePath)
-      }
+      await this.removeDirRecursive(targetPath)
     }
   }
 
   private async removeDirRecursive(dirPath: string): Promise<void> {
+    // 一次递归 list + 一次批量 delete，子请求从 1+N+2 降到 ~3，
+    // 避免大文件夹删除触发 CF Workers 子请求上限。
     const version = this.addition.list_object_version === "v2" ? "v2" : "v1"
-    const rawFiles = await this.client.listObjects(dirPath, version, true)
-    for (const file of rawFiles) {
-      const childPath = joinPath(dirPath, file.name)
-      if (file.isFolder) {
-        await this.removeDirRecursive(childPath)
-      } else {
-        await this.client.deleteObject(childPath)
-      }
+    const objects = await this.client.listAllObjects(dirPath, version)
+    if (objects.length) {
+      await this.client.deleteObjects(objects.map((o) => o.key))
     }
     const placeholderName = getPlaceholderName(this.addition.placeholder)
     await this.client
@@ -376,6 +363,33 @@ export class S3Driver implements StorageDriver {
     await this.checkDogeToken()
     const remotePath = this.getRemotePath(physicalPath)
     await this.client.putObject(remotePath, content)
+  }
+
+  async putStream(
+    virtualPath: string,
+    physicalPath: string,
+    stream: ReadableStream<Uint8Array>,
+    _size?: number,
+  ): Promise<void> {
+    await this.checkDogeToken()
+    const remotePath = this.getRemotePath(physicalPath)
+    // 数据型分片上传，内存有界，任意大小文件
+    await this.client.multipartUpload(remotePath, stream)
+  }
+
+  readonly supportsStreamUpload = true
+
+  async getStream(
+    physicalPath: string,
+    start?: number,
+  ): Promise<ReadableStream<Uint8Array>> {
+    // physicalPath 即远程 key（S3 物理路径与 key 一致）
+    const remotePath = this.getRemotePath(physicalPath)
+    const resp = await this.client.getObject(
+      remotePath,
+      start !== undefined ? { start } : undefined,
+    )
+    return resp.body as ReadableStream<Uint8Array>
   }
 
   async getDirectUploadInfo(
