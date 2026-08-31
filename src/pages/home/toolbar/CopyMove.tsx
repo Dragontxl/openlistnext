@@ -1,9 +1,9 @@
 import { Checkbox, createDisclosure, VStack, Button } from "@hope-ui/solid"
 import { createSignal, onCleanup } from "solid-js"
 import { ModalFolderChoose, FolderTreeHandler } from "~/components"
-import { useFetch, usePath, useRouter, useT } from "~/hooks"
+import { usePath, useRouter, useT } from "~/hooks"
 import { selectedObjs, userCan } from "~/store"
-import { bus, fsCopy, fsMove, handleRespWithNotifySuccess } from "~/utils"
+import { bus, fsCopy, fsMove, notify } from "~/utils"
 import { CgFolderAdd } from "solid-icons/cg"
 
 export const CreateFolderButton = (props: { handler?: FolderTreeHandler }) => {
@@ -25,7 +25,7 @@ export const CreateFolderButton = (props: { handler?: FolderTreeHandler }) => {
 export const Copy = () => {
   const t = useT()
   const { isOpen, onOpen, onClose } = createDisclosure()
-  const [loading, ok] = useFetch(fsCopy)
+  const [loading, setLoading] = createSignal(false)
   const { pathname } = useRouter()
   const { refresh } = usePath()
   const [overwrite, setOverwrite] = createSignal(false)
@@ -87,18 +87,42 @@ export const Copy = () => {
         </VStack>
       }
       onSubmit={async (dst) => {
-        const resp = await ok(
-          pathname(),
-          dst,
-          selectedObjs().map((obj) => obj.name),
-          overwrite(),
-          skipExisting(),
-          merge(),
-        )
-        handleRespWithNotifySuccess(resp, () => {
+        setLoading(true)
+        const names = selectedObjs().map((obj) => obj.name)
+        // 分批提交：每批 BATCH_SIZE 个，避免单次 Worker 调用超出
+        // Cloudflare 子请求上限（免费版 50）。S3 单文件 copy/move 约 2-3 子请求。
+        const batch = 10
+        const total = Math.ceil(names.length / batch)
+        let failed = false
+        try {
+          for (let i = 0; i < names.length; i += batch) {
+            const chunk = names.slice(i, i + batch)
+            const cur = Math.floor(i / batch) + 1
+            if (total > 1)
+              notify.info(`${t("home.toolbar.copy")} ${cur}/${total}`)
+            const resp = await fsCopy(
+              pathname(),
+              dst,
+              chunk,
+              overwrite(),
+              skipExisting(),
+              merge(),
+            )
+            if (resp.code !== 200) {
+              notify.error(resp.message)
+              failed = true
+              break
+            }
+          }
+        } catch (e: any) {
+          notify.error(e?.message || String(e))
+          failed = true
+        }
+        setLoading(false)
+        if (!failed) {
           refresh()
           onClose()
-        })
+        }
       }}
     />
   )
@@ -107,7 +131,7 @@ export const Copy = () => {
 export const Move = () => {
   const t = useT()
   const { isOpen, onOpen, onClose } = createDisclosure()
-  const [loading, ok] = useFetch(fsMove)
+  const [loading, setLoading] = createSignal(false)
   const { pathname } = useRouter()
   const { refresh } = usePath()
   const [overwrite, setOverwrite] = createSignal(false)
@@ -157,17 +181,39 @@ export const Move = () => {
         </VStack>
       }
       onSubmit={async (dst) => {
-        const resp = await ok(
-          pathname(),
-          dst,
-          selectedObjs().map((obj) => obj.name),
-          overwrite(),
-          skipExisting(),
-        )
-        handleRespWithNotifySuccess(resp, () => {
+        setLoading(true)
+        const names = selectedObjs().map((obj) => obj.name)
+        const batch = 10
+        const total = Math.ceil(names.length / batch)
+        let failed = false
+        try {
+          for (let i = 0; i < names.length; i += batch) {
+            const chunk = names.slice(i, i + batch)
+            const cur = Math.floor(i / batch) + 1
+            if (total > 1)
+              notify.info(`${t("home.toolbar.move")} ${cur}/${total}`)
+            const resp = await fsMove(
+              pathname(),
+              dst,
+              chunk,
+              overwrite(),
+              skipExisting(),
+            )
+            if (resp.code !== 200) {
+              notify.error(resp.message)
+              failed = true
+              break
+            }
+          }
+        } catch (e: any) {
+          notify.error(e?.message || String(e))
+          failed = true
+        }
+        setLoading(false)
+        if (!failed) {
           refresh()
           onClose()
-        })
+        }
       }}
     />
     // <CenterIcon tip="move" viewBox="0 0 1024 1024" fill="currentColor">

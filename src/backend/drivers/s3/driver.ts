@@ -51,11 +51,14 @@ export class S3Driver implements StorageDriver {
   private driverName: string
   private dogeExpiredAt?: number
   private dogeTimer?: any
+  /** CF Workers 子请求预算，由 driver 持有并共享给 S3Client */
+  private budget = { used: 0, limit: 45 }
 
   constructor(addition: S3Addition, driverName = "S3") {
     this.addition = normalizeS3Addition(addition)
     this.driverName = driverName
     this.client = new S3Client(this.addition)
+    this.client.updateBudget(this.budget)
   }
 
   async init(): Promise<void> {
@@ -83,6 +86,8 @@ export class S3Driver implements StorageDriver {
   }
 
   private async checkDogeToken(): Promise<void> {
+    // 每次外部操作入口重置子请求预算（driver 实例跨请求复用，避免累积）
+    this.budget.used = 0
     if (this.driverName.toLowerCase().includes("doge")) {
       const nowSec = Math.floor(Date.now() / 1000)
       if (!this.dogeExpiredAt || this.dogeExpiredAt - nowSec < 120) {
@@ -247,8 +252,26 @@ export class S3Driver implements StorageDriver {
       await this.client.copyObject(srcPath, dstPath, head.size)
       await this.client.deleteObject(srcPath)
     } else {
-      await this.copyDirRecursive(srcPath, dstPath)
-      await this.removeDirRecursive(srcPath)
+      // 文件夹：一次递归 list（无 delimiter）+ 逐个 copy + 批量 delete。
+      // 子请求从原来的 3+2N 降到 3+N（list 1 次 + delete 批量合并）。
+      const version = this.addition.list_object_version === "v2" ? "v2" : "v1"
+      const objects = await this.client.listAllObjects(srcPath, version)
+      const srcPrefix = getKey(srcPath, true)
+      const toDelete: string[] = []
+      for (const { key, size } of objects) {
+        const rel = key.startsWith(srcPrefix)
+          ? key.slice(srcPrefix.length)
+          : key
+        const dstKey = joinPath(dstPath, rel)
+        await this.client.copyObject(key, dstKey, size)
+        toDelete.push(key)
+      }
+      if (toDelete.length) await this.client.deleteObjects(toDelete)
+      // 清理可能残留的占位符对象
+      const placeholderName = getPlaceholderName(this.addition.placeholder)
+      await this.client
+        .deleteObject(joinPath(srcPath, placeholderName))
+        .catch(() => {})
     }
   }
 
@@ -267,7 +290,17 @@ export class S3Driver implements StorageDriver {
     if (head) {
       await this.client.copyObject(srcPath, dstPath, head.size)
     } else {
-      await this.copyDirRecursive(srcPath, dstPath)
+      // 文件夹：一次递归 list + 逐个 copy（不删源）。
+      const version = this.addition.list_object_version === "v2" ? "v2" : "v1"
+      const objects = await this.client.listAllObjects(srcPath, version)
+      const srcPrefix = getKey(srcPath, true)
+      for (const { key, size } of objects) {
+        const rel = key.startsWith(srcPrefix)
+          ? key.slice(srcPrefix.length)
+          : key
+        const dstKey = joinPath(dstPath, rel)
+        await this.client.copyObject(key, dstKey, size)
+      }
     }
   }
 

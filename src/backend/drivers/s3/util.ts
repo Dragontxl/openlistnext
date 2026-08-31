@@ -260,6 +260,8 @@ export class S3Client {
   private sessionToken?: string
   private isPathStyle: boolean
   private userAgent?: string
+  /** CF Workers 子请求预算（免费版单次调用上限 50，预留 5 给框架开销） */
+  private budget: { used: number; limit: number } = { used: 0, limit: 45 }
 
   constructor(addition: S3Addition) {
     this.addition = addition
@@ -297,6 +299,18 @@ export class S3Client {
     this.accessKeyId = credentials.accessKeyId
     this.secretAccessKey = credentials.secretAccessKey
     this.sessionToken = credentials.sessionToken
+  }
+
+  /** 由 driver 注入共享的子请求预算对象 */
+  public updateBudget(budget: { used: number; limit: number }) {
+    this.budget = budget
+  }
+
+  /** 预留一个子请求额度；超限时抛出友好错误而非 CF 裸 500 */
+  private reserve(): boolean {
+    if (this.budget.used >= this.budget.limit) return false
+    this.budget.used++
+    return true
   }
 
   /**
@@ -344,6 +358,11 @@ export class S3Client {
     body: string | Uint8Array | null = null,
     extraHeaders: Record<string, string> = {},
   ): Promise<Response> {
+    if (!this.reserve()) {
+      throw new Error(
+        `[S3] 已达 Cloudflare Workers 子请求上限(${this.budget.limit})，请减少单次操作的文件数量或分批操作`,
+      )
+    }
     const customHeaders: Record<string, string> = { ...extraHeaders }
     if (this.userAgent) {
       customHeaders["user-agent"] = this.userAgent
@@ -541,6 +560,105 @@ export class S3Client {
     if (!resp.ok && resp.status !== 404 && resp.status !== 204) {
       const text = await resp.text().catch(() => "")
       throw parseS3Error(text, resp.status)
+    }
+  }
+
+  /**
+   * 不带 delimiter 递归列出 prefix 下所有对象（一次或少数几次请求
+   * 即可覆盖整棵子树，替代逐层 listObjects，显著降低子请求数）。
+   * 返回相对 bucket 的完整对象 key 与 size。
+   */
+  public async listAllObjects(
+    dirPath: string,
+    version: "v1" | "v2" = "v1",
+  ): Promise<{ key: string; size: number }[]> {
+    const prefix = getKey(dirPath, true)
+    const placeholderName = getPlaceholderName(this.addition.placeholder || "")
+    const result: { key: string; size: number }[] = []
+
+    const collect = (xml: string) => {
+      for (const block of parseXmlBlocks(xml, "Contents")) {
+        const key = parseXmlTag(block, "Key")
+        if (!key) continue
+        const decodedKey = unescapeXml(key)
+        if (decodedKey.endsWith("/")) continue // 目录标记，跳过
+        const baseName = getBaseName(decodedKey)
+        if (baseName === placeholderName) continue
+        const size = parseInt(parseXmlTag(block, "Size") || "0", 10)
+        result.push({ key: decodedKey, size })
+      }
+    }
+
+    if (version === "v2") {
+      let continuationToken: string | undefined
+      while (true) {
+        const queryParams: Record<string, string> = {
+          "list-type": "2",
+          prefix,
+        }
+        if (continuationToken)
+          queryParams["continuation-token"] = continuationToken
+        const url = this.getUrl("", queryParams)
+        const resp = await this.fetch("GET", url)
+        const text = await resp.text()
+        if (!resp.ok) throw parseS3Error(text, resp.status)
+        collect(text)
+        const isTruncated = parseXmlTag(text, "IsTruncated") === "true"
+        const next = parseXmlTag(text, "NextContinuationToken")
+        if (!isTruncated) break
+        if (next) {
+          continuationToken = next
+          continue
+        }
+        if (result.length === 0) break
+      }
+    } else {
+      let marker: string | undefined
+      while (true) {
+        const queryParams: Record<string, string> = { prefix }
+        if (marker) queryParams["marker"] = marker
+        const url = this.getUrl("", queryParams)
+        const resp = await this.fetch("GET", url)
+        const text = await resp.text()
+        if (!resp.ok) throw parseS3Error(text, resp.status)
+        collect(text)
+        const isTruncated = parseXmlTag(text, "IsTruncated") === "true"
+        const next = parseXmlTag(text, "NextMarker")
+        if (!isTruncated) break
+        if (next) {
+          marker = next
+        } else if (result.length > 0) {
+          marker = result[result.length - 1].key
+        } else break
+      }
+    }
+
+    return result
+  }
+
+  /**
+   * 批量删除（S3 DeleteObjects，POST ?delete），一次最多 1000 个对象，
+   * 将 N 个 DELETE 子请求合并为 ceil(N/1000) 个。
+   */
+  public async deleteObjects(keys: string[]): Promise<void> {
+    if (!keys.length) return
+    const esc = (s: string) =>
+      s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    for (let i = 0; i < keys.length; i += 1000) {
+      const batch = keys.slice(i, i + 1000)
+      const body = [
+        "<Delete>",
+        ...batch.map((k) => `<Object><Key>${esc(k)}</Key></Object>`),
+        "</Delete>",
+      ].join("")
+      const url = this.getUrl("", { delete: "" })
+      const resp = await this.fetch("POST", url, body, {
+        "content-type": "application/xml",
+      })
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "")
+        throw parseS3Error(text, resp.status)
+      }
     }
   }
 
